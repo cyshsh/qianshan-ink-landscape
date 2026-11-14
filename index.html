@@ -52,6 +52,13 @@ body.nogl #nogl { display: flex; }
   .brand { bottom: auto !important; top: 18px; }
   .bar .rule { margin: 0 8px; }
 }
+@media (max-width: 520px) {
+  .bar { gap: 2px; width: calc(100% - 16px); justify-content: center; }
+  .bar [data-season] { width: 29px; height: 32px; line-height: 32px; font-size: 14px; }
+  .bar .rule { margin: 0 3px; }
+  .bar .act { font-size: 12px; letter-spacing: .1em; padding: 8px 2px; }
+  .bar .act + .act { margin-left: 3px; }
+}
 @media (prefers-reduced-motion: reduce) { #c, #ui { transition: none; } }
 
 </style>
@@ -69,6 +76,7 @@ body.nogl #nogl { display: flex; }
     <span class="rule"></span>
     <button class="act" id="next" title="&#x7A7A;&#x683C;">&#x6362;&#x5377;</button>
     <button class="act" id="save" title="S">&#x5B58;&#x56FE;</button>
+    <button class="act" id="sound" aria-pressed="true" title="&#x5173;&#x95ED;&#x58F0;&#x97F3;">&#x58F0;&#x97F3;&#x5F00;</button>
   </nav>
   <p id="hint">&#x62D6;&#x52A8;&#x5C55;&#x5377; &#xB7; &#x7A7A;&#x683C;&#x6362;&#x5377; &#xB7; &#x6570;&#x5B57;&#x952E;&#x6613;&#x5B63;</p>
 </div>
@@ -422,6 +430,39 @@ const SEASONS = [
       ['\u661F\u5782\u5E73\u91CE\u9614', '\u6708\u6D8C\u5927\u6C5F\u6D41', '\u675C\u752B'],
     ] },
 ];
+
+/* audio-model:start */
+const AUDIO_PROFILES = [
+  { id: 'spring', tempo: 72, scale: [0, 2, 4, 7, 9], root: 62, instrument: 'qin-bright', ambience: ['wind', 'leaves', 'birds'], density: .72 },
+  { id: 'summer', tempo: 66, scale: [0, 2, 5, 7, 9], root: 57, instrument: 'xiao-open', ambience: ['water', 'cicadas', 'frogs', 'thunder'], density: .64 },
+  { id: 'autumn', tempo: 54, scale: [0, 3, 5, 7, 10], root: 55, instrument: 'qin-warm', ambience: ['wind', 'maple', 'geese'], density: .48 },
+  { id: 'winter', tempo: 42, scale: [0, 2, 5, 7, 9], root: 50, instrument: 'qin-harmonic', ambience: ['cold-wind', 'snow', 'branch'], density: .34 },
+  { id: 'night', tempo: 46, scale: [0, 3, 5, 7, 10], root: 48, instrument: 'xiao-low', ambience: ['insects', 'water', 'night-wind'], density: .42 },
+];
+
+function makeAudioPattern(seed, seasonIndex, bars = 4) {
+  const profile = AUDIO_PROFILES[seasonIndex];
+  const R = mulberry32((seed * 8191 + seasonIndex * 131 + bars * 17) >>> 0);
+  const events = [];
+  const totalBeats = Math.max(1, bars) * 4;
+  let lastDegree = Math.floor(R() * profile.scale.length);
+  for (let beat = 0; beat < totalBeats; beat += .5) {
+    const downbeat = beat % 4 === 0;
+    if (!downbeat && R() > profile.density) continue;
+    const step = R() < .72 ? (R() < .5 ? -1 : 1) : Math.floor(R() * 5) - 2;
+    lastDegree = (lastDegree + step + profile.scale.length) % profile.scale.length;
+    const octave = R() > .82 ? 12 : (R() < .12 ? -12 : 0);
+    events.push({
+      beat,
+      note: profile.root + profile.scale[lastDegree] + octave,
+      duration: downbeat ? 1.45 : (R() < .55 ? .42 : .82),
+      velocity: +(downbeat ? .72 + R() * .12 : .38 + R() * .28).toFixed(3),
+    });
+  }
+  return events;
+}
+/* audio-model:end */
+
 const SEAL_TEXT = '\u5343\u5C71';
 const BRUSH_FONT = '"Ma Shan Zheng", "Kaiti SC", "STKaiti", "KaiTi", serif';
 const DIGITS = '\u3007\u4E00\u4E8C\u4E09\u56DB\u4E94\u516D\u4E03\u516B\u4E5D';
@@ -454,6 +495,259 @@ function vnoise(x) {
   return hash1(i) * (1 - u) + hash1(i + 1) * u;
 }
 const zhNum = n => String(n).padStart(4, '0').split('').map(d => DIGITS[+d]).join('');
+
+/* ---------------------------------------------------------------- audio */
+
+const audioEngine = (() => {
+  let ctx = null, master = null, delay = null, delayReturn = null, noiseBuffer = null;
+  let enabled = true, available = true, unlocked = false, hidden = false;
+  let scene = null, sceneGeneration = 0;
+  const ownedSources = new Set(), ownedTimers = new Set();
+
+  const midiHz = note => 440 * Math.pow(2, (note - 69) / 12);
+
+  function ensureContext() {
+    if (ctx) return true;
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (!AudioCtx) { available = false; return false; }
+    try {
+      ctx = new AudioCtx();
+      master = ctx.createGain(); // master-gain
+      master.gain.value = 0;
+      const limiter = ctx.createDynamicsCompressor();
+      limiter.threshold.value = -18;
+      limiter.knee.value = 12;
+      limiter.ratio.value = 6;
+      limiter.attack.value = .01;
+      limiter.release.value = .35;
+      delay = ctx.createDelay(.8);
+      delay.delayTime.value = .29;
+      const feedback = ctx.createGain();
+      feedback.gain.value = .18;
+      delayReturn = ctx.createGain();
+      delayReturn.gain.value = .13;
+      delay.connect(feedback); feedback.connect(delay);
+      delay.connect(delayReturn); delayReturn.connect(master);
+      master.connect(limiter); limiter.connect(ctx.destination);
+      noiseBuffer = ctx.createBuffer(1, Math.ceil(ctx.sampleRate * 4), ctx.sampleRate);
+      const data = noiseBuffer.getChannelData(0), R = mulberry32(90421);
+      let brown = 0;
+      for (let i = 0; i < data.length; i++) {
+        brown = brown * .985 + (R() * 2 - 1) * .12;
+        data[i] = clamp(brown, -1, 1);
+      }
+      return true;
+    } catch (e) {
+      available = false; ctx = null; master = null;
+      return false;
+    }
+  }
+
+  function own(source) {
+    ownedSources.add(source);
+    source.addEventListener('ended', () => ownedSources.delete(source), { once: true });
+    return source;
+  }
+
+  function timer(fn, ms, generation = sceneGeneration, always = false) {
+    const id = setTimeout(() => {
+      ownedTimers.delete(id);
+      if (generation === sceneGeneration && (always || (unlocked && enabled && !hidden))) fn();
+    }, ms);
+    ownedTimers.add(id);
+    return id;
+  }
+
+  function clearOwned() {
+    ownedTimers.forEach(clearTimeout); ownedTimers.clear();
+    ownedSources.forEach(source => { try { source.stop(); } catch (e) {} });
+    ownedSources.clear();
+  }
+
+  function rampMaster(value, seconds = .8) {
+    if (!master || !ctx) return;
+    const now = ctx.currentTime, target = Math.min(.22, Math.max(0, value));
+    master.gain.cancelScheduledValues(now);
+    master.gain.setValueAtTime(master.gain.value, now);
+    master.gain.linearRampToValueAtTime(target, now + seconds);
+  }
+
+  function envelope(gain, when, attack, hold, release, peak) {
+    gain.gain.setValueAtTime(.0001, when);
+    gain.gain.exponentialRampToValueAtTime(Math.max(.0002, peak), when + attack);
+    gain.gain.setValueAtTime(Math.max(.0002, peak * .72), when + attack + hold);
+    gain.gain.exponentialRampToValueAtTime(.0001, when + attack + hold + release);
+  }
+
+  function playTone(note, when, duration, velocity, profile) {
+    if (!ctx || when < ctx.currentTime - .1) return;
+    const osc = own(ctx.createOscillator()), partial = own(ctx.createOscillator());
+    const filter = ctx.createBiquadFilter(), gain = ctx.createGain(), send = ctx.createGain();
+    const flute = profile.instrument.startsWith('xiao');
+    osc.type = flute ? 'sine' : 'triangle';
+    partial.type = 'sine';
+    osc.frequency.setValueAtTime(midiHz(note), when);
+    partial.frequency.setValueAtTime(midiHz(note) * (flute ? 2.01 : 2), when);
+    partial.detune.setValueAtTime(flute ? -7 : 3, when);
+    filter.type = 'lowpass';
+    filter.frequency.setValueAtTime(flute ? 2300 : 3400, when);
+    filter.Q.value = flute ? 2.4 : .8;
+    send.gain.value = flute ? .22 : .1;
+    osc.connect(filter); partial.connect(filter); filter.connect(gain);
+    gain.connect(master); gain.connect(send); send.connect(delay);
+    const attack = flute ? .12 : .012, release = flute ? .72 : 1.15;
+    envelope(gain, when, attack, Math.max(.05, duration * .42), release, velocity * (flute ? .045 : .055));
+    osc.start(when); partial.start(when);
+    const stopAt = when + attack + duration * .42 + release + .08;
+    osc.stop(stopAt); partial.stop(stopAt);
+  }
+
+  function noiseLayer(type, amount, cutoff, generation) {
+    const source = own(ctx.createBufferSource()), filter = ctx.createBiquadFilter(), gain = ctx.createGain();
+    source.buffer = noiseBuffer; source.loop = true;
+    filter.type = type; filter.frequency.value = cutoff; filter.Q.value = type === 'bandpass' ? 1.3 : .25;
+    gain.gain.value = amount;
+    source.connect(filter); filter.connect(gain); gain.connect(master);
+    source.start();
+    if (generation !== sceneGeneration) source.stop();
+  }
+
+  function chirp(kind, R) {
+    if (!ctx) return;
+    const now = ctx.currentTime + .03;
+    if (kind === 'birds' || kind === 'geese') {
+      const base = kind === 'birds' ? 1250 + R() * 900 : 430 + R() * 90;
+      for (let i = 0; i < (kind === 'birds' ? 3 : 2); i++) {
+        const osc = own(ctx.createOscillator()), gain = ctx.createGain();
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(base * (1 + i * .11), now + i * .13);
+        osc.frequency.exponentialRampToValueAtTime(base * (1.35 + R() * .3), now + i * .13 + .11);
+        envelope(gain, now + i * .13, .008, .035, .12, kind === 'birds' ? .016 : .009);
+        osc.connect(gain); gain.connect(master); osc.start(now + i * .13); osc.stop(now + i * .13 + .3);
+      }
+    } else if (kind === 'cicadas' || kind === 'insects') {
+      const osc = own(ctx.createOscillator()), gain = ctx.createGain(), trem = ctx.createOscillator(), tremGain = ctx.createGain();
+      osc.type = 'square'; osc.frequency.value = kind === 'cicadas' ? 4100 : 2850 + R() * 600;
+      trem.frequency.value = kind === 'cicadas' ? 18 : 11; tremGain.gain.value = .004;
+      gain.gain.value = .003;
+      trem.connect(tremGain); tremGain.connect(gain.gain); osc.connect(gain); gain.connect(master);
+      osc.start(now); trem.start(now); osc.stop(now + .45 + R() * .8); trem.stop(now + .45 + R() * .8);
+    } else if (kind === 'frogs' || kind === 'branch') {
+      const osc = own(ctx.createOscillator()), gain = ctx.createGain();
+      osc.type = kind === 'frogs' ? 'sine' : 'triangle';
+      osc.frequency.setValueAtTime(kind === 'frogs' ? 115 : 170, now);
+      osc.frequency.exponentialRampToValueAtTime(kind === 'frogs' ? 78 : 62, now + .28);
+      envelope(gain, now, .015, .08, .26, kind === 'frogs' ? .018 : .012);
+      osc.connect(gain); gain.connect(master); osc.start(now); osc.stop(now + .48);
+    } else if (kind === 'thunder') {
+      const source = own(ctx.createBufferSource()), filter = ctx.createBiquadFilter(), gain = ctx.createGain();
+      source.buffer = noiseBuffer; filter.type = 'lowpass'; filter.frequency.value = 150;
+      envelope(gain, now, .18, .3, 2.4, .028);
+      source.connect(filter); filter.connect(gain); gain.connect(master); source.start(now); source.stop(now + 3.1);
+    }
+  }
+
+  function scheduleAmbience(profile, R, generation) {
+    const continuous = {
+      spring: [['lowpass', .007, 680], ['bandpass', .004, 2600]],
+      summer: [['lowpass', .009, 900], ['bandpass', .004, 3400]],
+      autumn: [['lowpass', .009, 520], ['bandpass', .003, 1800]],
+      winter: [['highpass', .005, 2400], ['lowpass', .008, 420]],
+      night: [['lowpass', .007, 720], ['bandpass', .003, 3100]],
+    }[profile.id];
+    continuous.forEach(x => noiseLayer(x[0], x[1], x[2], generation));
+    const eventKinds = profile.ambience.filter(x => ['birds', 'geese', 'cicadas', 'insects', 'frogs', 'branch', 'thunder'].includes(x));
+    const next = () => {
+      if (!eventKinds.length) return;
+      let kind = eventKinds[Math.floor(R() * eventKinds.length)];
+      if (kind === 'thunder' && R() > .12) kind = 'frogs';
+      chirp(kind, R);
+      timer(next, 3800 + R() * (profile.id === 'night' ? 4200 : 7200), generation);
+    };
+    timer(next, 1200 + R() * 2600, generation);
+  }
+
+  function schedulePhrase(profile, seed, generation) {
+    const beatSeconds = 60 / profile.tempo, pattern = makeAudioPattern(seed, AUDIO_PROFILES.indexOf(profile), 4);
+    const start = ctx.currentTime + .12;
+    pattern.forEach(event => playTone(event.note, start + event.beat * beatSeconds, event.duration * beatSeconds, event.velocity, profile));
+    const phraseMs = 16 * beatSeconds * 1000;
+    timer(() => schedulePhrase(profile, seed + 1, generation), phraseMs - 120, generation);
+  }
+
+  function startScene() {
+    if (!ctx || !scene || !enabled || hidden) return;
+    const generation = sceneGeneration, profile = AUDIO_PROFILES[scene.seasonIndex];
+    const R = mulberry32(scene.seed * 3571 + scene.seasonIndex * 89 + generation);
+    schedulePhrase(profile, scene.seed, generation);
+    scheduleAmbience(profile, R, generation);
+    rampMaster(.18, 1.35);
+  }
+
+  async function unlock() {
+    if (!enabled || hidden || !ensureContext()) return false;
+    try { await ctx.resume(); } catch (e) { available = false; return false; }
+    if (!unlocked) { unlocked = true; sceneGeneration++; clearOwned(); startScene(); }
+    else rampMaster(.18, .7);
+    return true;
+  }
+
+  function setEnabled(next) {
+    enabled = !!next;
+    if (!ctx || !unlocked) return;
+    if (enabled) {
+      ctx.resume().then(() => { sceneGeneration++; clearOwned(); startScene(); }).catch(() => { available = false; });
+    } else {
+      rampMaster(0, .35);
+      const generation = ++sceneGeneration;
+      timer(() => clearOwned(), 420, generation, true);
+    }
+  }
+
+  function setScene(seed, seasonIndex, isNewSeason) {
+    scene = { seed, seasonIndex };
+    if (!ctx || !unlocked || !enabled || hidden) return;
+    rampMaster(0, isNewSeason ? .65 : .32);
+    const generation = ++sceneGeneration;
+    timer(() => { clearOwned(); startScene(); }, isNewSeason ? 720 : 380, generation);
+  }
+
+  function paper() {
+    if (!ctx || !unlocked || !enabled || hidden) return;
+    const now = ctx.currentTime, source = own(ctx.createBufferSource());
+    const filter = ctx.createBiquadFilter(), gain = ctx.createGain();
+    source.buffer = noiseBuffer; filter.type = 'bandpass'; filter.frequency.value = 1450; filter.Q.value = .7;
+    envelope(gain, now, .015, .08, .48, .014);
+    source.connect(filter); filter.connect(gain); gain.connect(master); source.start(now); source.stop(now + .75);
+  }
+
+  function suspend() {
+    hidden = true;
+    if (!ctx) return;
+    rampMaster(0, .25);
+    const generation = ++sceneGeneration;
+    timer(() => { clearOwned(); ctx.suspend().catch(() => {}); }, 300, generation, true);
+  }
+
+  function resume() {
+    hidden = false;
+    if (!ctx || !unlocked || !enabled) return;
+    ctx.resume().then(() => { sceneGeneration++; clearOwned(); startScene(); }).catch(() => { available = false; });
+  }
+
+  return {
+    unlock() { return unlock(); },
+    setEnabled(enabled) { setEnabled(enabled); },
+    setScene(seed, seasonIndex, isNewSeason) { setScene(seed, seasonIndex, isNewSeason); },
+    paper() { paper(); },
+    suspend() { suspend(); },
+    resume() { resume(); },
+    get enabled() { return enabled; },
+    get available() { return available; },
+  };
+})();
+
+document.addEventListener('visibilitychange', () => document.hidden ? audioEngine.suspend() : audioEngine.resume());
 
 // CPU mirror of the shader's ridge(), used only to keep the sun clear of the far peaks
 const fract = x => x - Math.floor(x);
@@ -952,10 +1246,12 @@ function overlayDims() {
   return [Math.max(2, Math.round(w * d * k)), Math.max(2, Math.round(h * d * k))];
 }
 function setPainting(seed, si) {
+  const seasonChanged = !!st.P && si !== st.si;
   st.seed = seed; st.si = si;
   st.P = derive(seed, si);
   uploadOverlay(...overlayDims());
   st.born = performance.now();
+  audioEngine.setScene(seed, si, seasonChanged);
   syncUI();
 }
 function resize() {
@@ -1048,8 +1344,22 @@ function frame(now) {
 
 const ui = {
   root: $('#ui'), seasons: [...document.querySelectorAll('[data-season]')],
-  vol: $('#vol'), style: $('#style'), next: $('#next'), save: $('#save'), hint: $('#hint'),
+  vol: $('#vol'), style: $('#style'), next: $('#next'), save: $('#save'), sound: $('#sound'), hint: $('#hint'),
 };
+function syncSoundUI() {
+  if (!audioEngine.available) {
+    ui.sound.textContent = '\u65E0\u58F0';
+    ui.sound.title = '\u6B64\u6D4F\u89C8\u5668\u65E0\u6CD5\u64AD\u653E\u58F0\u97F3';
+    ui.sound.disabled = true;
+    ui.sound.setAttribute('aria-pressed', 'false');
+    return;
+  }
+  const on = audioEngine.enabled;
+  ui.sound.disabled = false;
+  ui.sound.textContent = on ? '\u58F0\u97F3\u5F00' : '\u58F0\u97F3\u5173';
+  ui.sound.title = on ? '\u5173\u95ED\u58F0\u97F3' : '\u5F00\u542F\u58F0\u97F3';
+  ui.sound.setAttribute('aria-pressed', String(on));
+}
 function syncUI() {
   const S = SEASONS[st.si];
   ui.seasons.forEach((b, i) => b.classList.toggle('on', i === st.si));
@@ -1057,10 +1367,12 @@ function syncUI() {
   ui.style.textContent = S.style;
   document.body.classList.toggle('night', !!S.night);
   document.title = `\u5343\u5C71 \u00B7 \u5377${zhNum(st.seed)} \u00B7 ${S.style}`;
+  syncSoundUI();
   try { history.replaceState(null, '', `#s=${st.seed}&m=${st.si}${STILL ? '&still' : ''}`); } catch (e) {}
 }
 function go(seed, si) {
   if (st.leaving) { st.next = [seed, si]; return; }
+  if (si === st.si && seed !== st.seed) audioEngine.paper();
   st.next = [seed, si];
   st.leaving = performance.now();
   ui.hint.classList.add('gone');
@@ -1069,6 +1381,18 @@ const newSeed = () => Math.floor(Math.random() * 10000);
 ui.seasons.forEach((b, i) => b.addEventListener('click', () => { if (i !== st.si) go(st.seed, i); }));
 ui.next.addEventListener('click', () => go(newSeed(), st.si));
 ui.save.addEventListener('click', savePng);
+ui.sound.addEventListener('click', () => {
+  const next = !audioEngine.enabled;
+  audioEngine.setEnabled(next);
+  if (next) audioEngine.unlock().then(syncSoundUI);
+  syncSoundUI();
+});
+
+function unlockAudioFromGesture() {
+  ['pointerdown', 'keydown'].forEach(name => removeEventListener(name, unlockAudioFromGesture, true));
+  audioEngine.unlock().then(syncSoundUI);
+}
+['pointerdown', 'keydown'].forEach(name => addEventListener(name, unlockAudioFromGesture, { capture: true, once: true }));
 
 function savePng() {
   const [w, h] = viewSize();
